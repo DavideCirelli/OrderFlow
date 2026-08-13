@@ -64,7 +64,8 @@ let carts = { cliente: {}, cassa: {} };
 let filters = { cliente: 'tutto', cassa: 'tutto' };
 let currentTab = 'cliente';
 let cardModalContext = null;
-let trackedOrderId = null;
+let trackedOrderIds = [];   // tutti gli ordini attivi di questo cliente (può ordinare più volte)
+let activeStatusOrderId = null; // quale ordine sta mostrando la schermata a tutto schermo in questo momento
 let notifiedOrders = new Set();
 let lastCucinaCount = 0, lastBarCount = 0, lastPendingCount = 0;
 let lastMenuSig = null;
@@ -77,14 +78,17 @@ function tsToMillis(ts){ return (ts && typeof ts.toMillis === 'function') ? ts.t
 /* ============ FIRESTORE: numero ordine progressivo ============
    Un contatore condiviso (counters/orders) incrementato dentro una
    transazione, così due ordini creati nello stesso istante da
-   dispositivi diversi non ricevono mai lo stesso numero. */
+   dispositivi diversi non ricevono mai lo stesso numero.
+   Si resetta da solo a #1 al primo ordine di ogni nuovo giorno. */
 async function getNextOrderNumber(){
   const counterRef = doc(db, 'counters', 'orders');
+  const todayKey = new Date().toDateString(); // stessa convenzione usata per "oggi" nelle statistiche admin
   return await runTransaction(db, async (tx) => {
     const snap = await tx.get(counterRef);
-    const current = snap.exists() ? (snap.data().value || 0) : 0;
+    const data = snap.exists() ? snap.data() : null;
+    const current = (data && data.date === todayKey) ? (data.value || 0) : 0;
     const next = current + 1;
-    tx.set(counterRef, { value: next }, { merge: true });
+    tx.set(counterRef, { value: next, date: todayKey }, { merge: true });
     return next;
   });
 }
@@ -171,6 +175,7 @@ function refreshAuthUI(){
     }
   });
   if(currentTab === 'admin' && session.admin) renderAdminAll();
+  renderTabsBar();
   renderAll();
 }
 
@@ -352,15 +357,20 @@ async function settlePending(orderId, method){
 
 /* ============ ORDER STATUS SCREEN ============ */
 function showOrderStatus(orderId){
-  trackedOrderId = orderId;
+  if(!trackedOrderIds.includes(orderId)) trackedOrderIds.push(orderId);
+  activeStatusOrderId = orderId;
   renderOrderStatus();
   renderNotifRow();
   ensureNotificationPermission();
   document.getElementById('status-screen').classList.add('open');
 }
-function closeOrderStatus(){ document.getElementById('status-screen').classList.remove('open'); updateOrderChip(); }
-function dismissChip(evt){ evt.stopPropagation(); trackedOrderId = null; updateOrderChip(); }
-function openTrackedOrder(){ if(trackedOrderId) showOrderStatus(trackedOrderId); }
+function closeOrderStatus(){ document.getElementById('status-screen').classList.remove('open'); renderOrderChips(); }
+function dismissChip(evt, orderId){
+  evt.stopPropagation();
+  trackedOrderIds = trackedOrderIds.filter(id => id !== orderId);
+  renderOrderChips();
+}
+function openTrackedOrder(orderId){ showOrderStatus(orderId); }
 
 function stationProgress(orderId, cat){
   const t = tickets.find(tk=>tk.orderId===orderId && tk.cat===cat);
@@ -382,15 +392,29 @@ function stepTrackHtml(cat, status){
   });
   return `<div class="track-station"><div class="track-label">${ico} ${label}</div><div class="track-steps">${stepsHtml}</div></div>`;
 }
+function orderSummaryHtml(order){
+  const lines = order.items.map(i => `
+    <div class="summary-line">
+      <span>${i.qty}× ${i.name}</span>
+      <span class="mono">€${(i.price*i.qty).toFixed(2)}</span>
+    </div>
+  `).join('');
+  return `
+    <div class="order-summary">
+      ${lines}
+      <div class="summary-total"><span>Totale</span><span class="mono">€${order.total.toFixed(2)}</span></div>
+    </div>
+  `;
+}
 function renderOrderStatus(){
-  const order = orders.find(o=>o.id===trackedOrderId);
+  const order = orders.find(o=>o.id===activeStatusOrderId);
   const body = document.getElementById('status-body');
   if(!order){ body.innerHTML = ''; return; }
   document.getElementById('status-number').textContent = '#' + String(order.number).padStart(3,'0');
 
   if(order.paymentStatus === 'in_attesa'){
     document.getElementById('status-eyebrow').textContent = 'Ordine registrato';
-    body.innerHTML = `<div class="pending-banner"><span class="pb-dot"></span>In attesa di pagamento in cassa — mostra questo numero allo sportello.</div>`;
+    body.innerHTML = `<div class="pending-banner"><span class="pb-dot"></span>In attesa di pagamento in cassa — mostra questo numero allo sportello.</div>${orderSummaryHtml(order)}`;
     return;
   }
   const cats = [...new Set(order.items.map(i=>i.cat))];
@@ -402,6 +426,7 @@ function renderOrderStatus(){
   if(allPicked){ html += `<div class="ready-banner">✓ Ordine ritirato</div>`; }
   else if(allReady){ html += `<div class="ready-banner">✓ Pronto per il ritiro!</div>`; }
   html += cats.map(cat=>stepTrackHtml(cat, stationProgress(order.id, cat) || 'coda')).join('');
+  html += orderSummaryHtml(order);
   body.innerHTML = html;
   renderNotifRow();
 }
@@ -414,19 +439,34 @@ function orderShortStatus(order){
   if(statuses.some(s=>s==='prep')) return {text:'in preparazione', ready:false, done:false};
   return {text:'ricevuto', ready:false, done:false};
 }
-function updateOrderChip(){
-  const chip = document.getElementById('order-chip');
-  if(!trackedOrderId){ chip.classList.add('hidden'); return; }
-  const order = orders.find(o=>o.id===trackedOrderId);
-  if(!order){ chip.classList.add('hidden'); return; }
-  const s = orderShortStatus(order);
-  maybeNotifyReady(order, s);
-  if(s.done){ chip.classList.add('hidden'); return; }
-  chip.classList.remove('hidden');
-  document.getElementById('oc-num').textContent = '#' + String(order.number).padStart(3,'0');
-  const statusEl = document.getElementById('oc-status');
-  statusEl.textContent = s.text;
-  statusEl.classList.toggle('ready', s.ready);
+function renderOrderChips(){
+  const container = document.getElementById('order-chips');
+  if(!container) return;
+
+  // controlla ogni ordine tracciato: notifica se pronto, scarta quelli già ritirati
+  const stillActive = [];
+  trackedOrderIds.forEach(id=>{
+    const order = orders.find(o=>o.id===id);
+    if(!order) return; // non ancora arrivato dal listener, o rimosso
+    const s = orderShortStatus(order);
+    maybeNotifyReady(order, s);
+    if(!s.done) stillActive.push({order, status:s});
+  });
+  trackedOrderIds = stillActive.map(x=>x.order.id);
+
+  if(stillActive.length === 0){ container.innerHTML = ''; return; }
+  container.innerHTML = stillActive.map(({order, status})=>`
+    <div class="order-chip" onclick="openTrackedOrder('${order.id}')">
+      <div class="oc-left">
+        <div class="oc-num">#${String(order.number).padStart(3,'0')}</div>
+        <div class="oc-status ${status.ready?'ready':''}">${status.text}</div>
+      </div>
+      <div class="oc-right">
+        <span class="oc-go">Vedi ▸</span>
+        <button class="oc-x" onclick="dismissChip(event,'${order.id}')">×</button>
+      </div>
+    </div>
+  `).join('');
 }
 
 /* ============ NOTIFICHE ORDINE PRONTO ============ */
@@ -485,6 +525,58 @@ function maybeNotifyReady(order, status){
     fireReadyNotification(order);
   }
 }
+
+/* ============ BARRA TAB DINAMICA per ruolo ============
+   Cliente: nessuna barra, mai. Cucina/Bar: solo la propria
+   sezione, nessuna barra. Cassa: Cliente + Cassa. Admin:
+   tutte e 5 le sezioni, come oggi. */
+const ALL_TABS = [
+  {key:'cliente', label:'Cliente', sub:'ordina & paga'},
+  {key:'cassa',   label:'Cassa',   badgeId:'badge-cassa'},
+  {key:'cucina',  label:'Cucina',  badgeId:'badge-cucina'},
+  {key:'bar',     label:'Bar',     badgeId:'badge-bar'},
+  {key:'admin',   label:'Admin',   sub:'gestione'}
+];
+function visibleTabKeys(){
+  if(session.admin) return ['cliente','cassa','cucina','bar','admin'];
+  const tabs = [];
+  if(session.cassa) tabs.push('cliente','cassa');
+  if(session.cucina) tabs.push('cucina');
+  if(session.bar) tabs.push('bar');
+  if(tabs.length === 0) tabs.push('cliente');
+  return tabs;
+}
+function renderTabsBar(){
+  const keys = visibleTabKeys();
+  const tabsEl = document.getElementById('tabs');
+  const staffEntry = document.getElementById('staff-entry');
+  const noStaffLoggedIn = !session.cassa && !session.cucina && !session.bar && !session.admin;
+  staffEntry.classList.toggle('hidden', !noStaffLoggedIn);
+  if(!noStaffLoggedIn) closeStaffMenu();
+
+  const showBar = keys.length > 1;
+  tabsEl.classList.toggle('hidden', !showBar);
+  if(showBar){
+    tabsEl.innerHTML = '<div class="tab-indicator" id="tab-indicator"></div>' + keys.map(k=>{
+      const t = ALL_TABS.find(x=>x.key===k);
+      const badgeSpan = t.badgeId ? `<span class="n" id="${t.badgeId}"></span>` : `<span class="n">${t.sub||''}</span>`;
+      return `<button class="tab ${currentTab===k?'active':''}" data-tab="${k}" onclick="switchTab('${k}')">${t.label}${badgeSpan}</button>`;
+    }).join('');
+  }
+  if(!keys.includes(currentTab)){
+    currentTab = keys[0];
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+    document.getElementById('view-'+currentTab).classList.add('active');
+  }
+  positionIndicator();
+}
+function toggleStaffMenu(){ document.getElementById('staff-menu').classList.toggle('hidden'); }
+function closeStaffMenu(){ document.getElementById('staff-menu').classList.add('hidden'); }
+function goToRole(role){ closeStaffMenu(); switchTab(role); }
+document.addEventListener('click', (e) => {
+  const entry = document.getElementById('staff-entry');
+  if(entry && !entry.contains(e.target)) closeStaffMenu();
+});
 
 /* ============ CASSA PENDING ============ */
 function renderCassaPending(){
@@ -630,9 +722,12 @@ function renderBadges(){
   const pendingCount = orders.filter(o=>o.source==='app' && o.paymentStatus==='in_attesa').length;
   const cucinaCount = tickets.filter(t=>t.cat==='cibo' && (t.status==='coda'||t.status==='prep')).length;
   const barCount = tickets.filter(t=>(t.cat==='bevande' && t.status!=='consegnato') || (t.cat==='cibo' && t.status==='pronto')).length;
-  document.getElementById('badge-cassa').textContent = pendingCount ? pendingCount+' da incassare' : '';
-  document.getElementById('badge-cucina').textContent = cucinaCount ? cucinaCount+' attive' : '';
-  document.getElementById('badge-bar').textContent = barCount ? barCount+' attive' : '';
+  const badgeCassa = document.getElementById('badge-cassa');
+  const badgeCucina = document.getElementById('badge-cucina');
+  const badgeBar = document.getElementById('badge-bar');
+  if(badgeCassa) badgeCassa.textContent = pendingCount ? pendingCount+' da incassare' : '';
+  if(badgeCucina) badgeCucina.textContent = cucinaCount ? cucinaCount+' attive' : '';
+  if(badgeBar) badgeBar.textContent = barCount ? barCount+' attive' : '';
   if(pendingCount > lastPendingCount && isAuthorized('cassa') && currentTab !== 'cassa') toast('Nuovo ordine', 'Un cliente attende di pagare in cassa.', 'var(--cassa)');
   if(cucinaCount > lastCucinaCount && isAuthorized('cucina') && currentTab !== 'cucina') toast('Cucina', 'Nuova comanda ricevuta.', 'var(--cucina)');
   if(barCount > lastBarCount && isAuthorized('bar') && currentTab !== 'bar') toast('Bar', 'Nuova comanda ricevuta.', 'var(--bar)');
@@ -660,7 +755,6 @@ function switchTab(tab){
   if(tab==='admin' && session.admin) renderAdminAll();
   renderAll();
 }
-
 /* ============ MASTER RENDER (chiamato dai listener Firestore) ============ */
 function ticketsSig(cat){
   return tickets.filter(t=>t.cat===cat && t.status!=='consegnato').map(t=>t.id+':'+t.status).sort().join('|');
@@ -681,7 +775,7 @@ function renderAll(){
   const barSig = barBoardSig();
   if(barSig !== lastBarTicketSig){ lastBarTicketSig = barSig; renderKanban('kanban-bar','bevande','bar'); }
   renderBadges();
-  updateOrderChip();
+  renderOrderChips();
   if(document.getElementById('status-screen').classList.contains('open')) renderOrderStatus();
   const sig = menu().map(m=>m.id).join(',');
   if(sig !== lastMenuSig){
@@ -765,8 +859,8 @@ function init(){
   registerServiceWorker();
   setupInstallBanner();
   renderCatTabs('cliente'); renderCatTabs('cassa');
+  renderTabsBar();
   refreshAuthUI();
-  positionIndicator();
   window.addEventListener('resize', positionIndicator);
   initListeners();
 }
@@ -780,7 +874,8 @@ Object.assign(window, {
   settlePending, showOrderStatus, closeOrderStatus, dismissChip, openTrackedOrder,
   ensureNotificationPermission, advanceTicket,
   attemptLogin, logout, addMenuItem, removeMenuItem, setAdminPanel,
-  installApp, dismissInstallBanner
+  installApp, dismissInstallBanner,
+  toggleStaffMenu, goToRole
 });
 
 init();
